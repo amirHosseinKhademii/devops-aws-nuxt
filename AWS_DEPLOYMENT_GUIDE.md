@@ -493,3 +493,200 @@ Think of deployment like this:
 
 If one fails, deployment fails. The logs/events tell you which layer is broken.
 
+---
+
+## 11) Public Domain Setup (Super Detailed)
+
+This section explains how to move from temporary task IP to a stable public URL like:
+
+- `https://www.yourdomain.com`
+
+Current state (what you have now):
+
+- ECS service is running
+- You can access app by public task IP and port (temporary)
+- You do **not** yet have stable DNS + HTTPS
+
+Target state (what you want):
+
+- A real domain
+- HTTPS certificate
+- Application Load Balancer in front of ECS
+- DNS record pointing to ALB
+
+### Architecture after domain setup
+
+User browser -> `www.yourdomain.com` -> ALB (443) -> Target Group -> ECS Service Task (`app:3000`)
+
+### Prerequisites
+
+Before starting, confirm:
+
+1. Region is `eu-west-1` in AWS console.
+2. ECS service is healthy or at least deployable.
+3. You own a domain (Route 53 or external registrar).
+4. ECS container name is `app` and container port is `3000`.
+
+### Step A) Domain strategy
+
+Choose one of these:
+
+1. Use Route 53 for full DNS management (easiest in AWS).
+2. Keep external DNS provider (Cloudflare/GoDaddy/Namecheap) and only point records to ALB.
+
+You can still use ACM certificate in both cases.
+
+### Step B) Request TLS certificate in ACM
+
+1. Open **AWS Certificate Manager (ACM)**.
+2. Ensure region is **eu-west-1** (same region as ALB).
+3. Click **Request certificate**.
+4. Type: **Request a public certificate**.
+5. Add domain names:
+   - `www.yourdomain.com` (required)
+   - `yourdomain.com` (optional root domain)
+6. Validation method: **DNS validation**.
+7. Click **Request**.
+8. ACM shows CNAME records for validation.
+9. Add those CNAME records in your DNS provider.
+10. Wait until certificate status becomes **Issued**.
+
+Notes:
+
+- Do not continue to HTTPS listener setup until ACM status is `Issued`.
+- If certificate stays pending, DNS validation records are missing or wrong.
+
+### Step C) Create target group for ECS (Fargate)
+
+1. Open **EC2 Console** -> left menu -> **Target Groups**.
+2. Click **Create target group**.
+3. Target type: **IP** (important for Fargate; do not use instance).
+4. Protocol: **HTTP**.
+5. Port: `3000`.
+6. VPC: choose same VPC used by ECS service.
+7. Health check:
+   - Protocol: HTTP
+   - Path: `/`
+   - Matcher: `200-399`
+8. Name it (example): `nuxt-tg`.
+9. Click **Create target group**.
+
+Notes:
+
+- If your app has dedicated health endpoint (`/health`), use that path instead.
+- If health checks fail, ECS may keep cycling tasks.
+
+### Step D) Create Application Load Balancer (ALB)
+
+1. EC2 Console -> **Load Balancers** -> **Create load balancer**.
+2. Select **Application Load Balancer**.
+3. Name: `nuxt-alb`.
+4. Scheme: **Internet-facing**.
+5. IP address type: **IPv4**.
+6. Network mapping:
+   - Select your VPC
+   - Select at least **2 public subnets** in different AZs
+7. Security group:
+   - Allow inbound TCP `80` from `0.0.0.0/0`
+   - Allow inbound TCP `443` from `0.0.0.0/0`
+8. Listeners:
+   - Listener 1: HTTP : 80
+   - Listener 2: HTTPS : 443
+9. For HTTPS listener, select ACM certificate from Step B.
+10. Default action:
+   - Forward to target group `nuxt-tg`
+11. Create ALB.
+
+Recommended improvement:
+
+- Configure HTTP:80 listener action to **redirect to HTTPS:443**.
+
+### Step E) Attach ALB to ECS service
+
+1. Open **ECS** -> **Clusters** -> `nuxt-cluster`.
+2. Open service: `nuxt-app-task-service-1uesxq5z` (or your final service name).
+3. Click **Update**.
+4. In load balancing section:
+   - Load balancer type: **Application Load Balancer**
+   - Select existing ALB: `nuxt-alb`
+   - Select target group: `nuxt-tg`
+   - Container name: `app`
+   - Container port: `3000`
+5. Continue and deploy update.
+6. Wait for service stabilization.
+
+Validation after update:
+
+- Target group should show healthy target(s).
+- ECS service desired/running should become `1/1`.
+
+### Step F) DNS record to point domain to ALB
+
+#### If using Route 53
+
+1. Open **Route 53** -> **Hosted zones** -> select your domain zone.
+2. Click **Create record**.
+3. Record type:
+   - For `www`: **A - IPv4 address**
+4. Enable **Alias** = Yes.
+5. Alias target: choose your ALB DNS.
+6. Record name:
+   - `www`
+7. Save record.
+
+Optional root record:
+
+- Create another alias A record for root (`@`) to same ALB.
+
+#### If using external DNS provider
+
+1. Go to DNS panel of registrar/provider.
+2. Create record:
+   - Host: `www`
+   - Type: `CNAME`
+   - Value: your ALB DNS name (e.g. `nuxt-alb-123456.eu-west-1.elb.amazonaws.com`)
+3. Save.
+4. Keep ACM validation records unchanged.
+
+### Step G) Security group sanity check
+
+You need both sides correct:
+
+1. ALB security group:
+   - inbound 80/443 from internet
+2. ECS task/service security group:
+   - inbound 3000 from ALB security group (recommended)
+   - avoid broad inbound from internet if ALB is used
+
+### Step H) Test and verify
+
+1. Open `https://www.yourdomain.com`.
+2. Confirm lock icon (valid TLS cert).
+3. In ALB target group:
+   - target health = healthy
+4. In ECS service:
+   - deployments stable
+   - running tasks match desired count
+
+### Common problems and fixes
+
+1. Domain not resolving:
+   - DNS record missing or propagation delay.
+2. HTTPS certificate pending:
+   - ACM DNS validation CNAME not set correctly.
+3. 502/503 from ALB:
+   - target group health failing
+   - wrong container port or path
+   - security group blocks ALB -> ECS traffic.
+4. Works on IP but not domain:
+   - DNS points to wrong target
+   - HTTPS listener/certificate not configured.
+
+### Optional production hardening
+
+1. Redirect all HTTP to HTTPS.
+2. Add WAF on ALB.
+3. Set health check endpoint in app (`/health`).
+4. Use Route 53 health checks and alarms.
+5. Use fixed service name (`nuxt-service`) and document all resource names.
+
