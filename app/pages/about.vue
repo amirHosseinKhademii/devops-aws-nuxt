@@ -3,5 +3,5 @@
 </template>
 
 <script lang="ts" setup>
-const count = ref<number>(0);
+const count = ref<number>(1);
 </script>
